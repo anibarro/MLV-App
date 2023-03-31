@@ -31,6 +31,9 @@
 #include "../../debayer/debayer.h"
 #include <time.h>
 #include <omp.h>
+#include <assert.h>
+
+#undef STDOUT_SILENT
 
 #define EV_RESOLUTION 65536
 #ifndef M_PI
@@ -276,7 +279,7 @@ int diso_get_preview(uint16_t * image_data,dual_iso_freeze_data_t* iso_data, uin
 #define raw_get_pixel32(x,y) (raw_buffer_32[(x) + (y) * raw_info.width])
 #define raw_set_pixel32(x,y,value) raw_buffer_32[(x) + (y)*raw_info.width] = value
 #define raw_get_pixel_20to16(x,y) ((raw_get_pixel32(x,y) >> 4) & 0xFFFF)
-#define raw_set_pixel_20to16_rand(x,y,value) image_data[(x) + (y) * raw_info.width] = COERCE((int)((value) / 16.0 + fast_randn05() + 0.5), 0, 0xFFFF)
+#define raw_set_pixel_20to16_rand(i,value) image_data[i] = COERCE((int)((value) / 16.0 + fast_randn05() + 0.5), 0, 0xFFFF)
 #define raw_set_pixel20(x,y,value) raw_buffer_32[(x) + (y) * raw_info.width] = COERCE((value), 0, 0xFFFFF)
 
 static const double fullres_start = 4;
@@ -338,7 +341,7 @@ static void white_detect(struct raw_info raw_info, uint16_t * image_data, int* w
     whites[1] = -kth_smallest_int(pixels[1], counts[1], discard_pixels[1]) - safety_margins[1];
     
     /* we assume 14-bit input data; out-of-range white levels may cause crash */
-    *white_dark = COERCE(whites[0], 10000, 16383);
+    *white_dark = COERCE(whites[0], 5000, 16383);
     *white_bright = COERCE(whites[1], 5000, 16383);
 #ifndef STDOUT_SILENT
     printf("White levels    : %d %d\n", *white_dark, *white_bright);
@@ -347,30 +350,40 @@ static void white_detect(struct raw_info raw_info, uint16_t * image_data, int* w
     free(pixels[1]);
 }
 
-static void compute_black_noise(struct raw_info raw_info, uint16_t * image_data, int x1, int x2, int y1, int y2, int dx, int dy, double* out_mean, double* out_stdev)
+static void compute_black_noise20(struct raw_info raw_info, uint32_t * raw_buffer_32,int y1, int y2, int dx, int dy, double* out_mean, double* out_stdev)
 {
+    int x1 = 8;
+    int x2 = raw_info.active_area.x1 - 8;
+
+    if (x2 <= 0){
+        // We have no access to sensor device "black bars" zone to measure noise (because it's cropped I guess)
+        *out_mean = raw_info.black_level;
+        *out_stdev = 8+6; /* default to 11 stops of DR */
+        return;
+    }
+
+    double mean, stdev;
+
     long long black = 0;
     int num = 0;
     /* compute average level */
-#pragma omp parallel for schedule(static) default(none) shared(raw_info, image_data,y1,y2,dy,dx,x1,x2) reduction(+:black) reduction(+:num) collapse(2)
     for (int y = y1; y < y2; y += dy)
     {
         for (int x = x1; x < x2; x += dx)
         {
-            black += raw_get_pixel(x, y);
+            black += raw_get_pixel20(x, y);
             num++;
         }
     }
-    double mean = (double) black / num;
-    
+    mean = (double) black / num;
+
     /* compute standard deviation */
-    double stdev = 0;
-//#xpragma omp parallel for schedule(static) default(none) shared(raw_info, image_data, mean,y1,y2,dy,dx,x1,x2) reduction(+:stdev)
+    stdev = 0;
     for (int y = y1; y < y2; y += dy)
     {
         for (int x = x1; x < x2; x += dx)
         {
-            double dif = raw_get_pixel(x, y) - mean;
+            double dif = raw_get_pixel20(x, y) - mean;
             stdev += dif * dif;
         }
     }
@@ -380,7 +393,8 @@ static void compute_black_noise(struct raw_info raw_info, uint16_t * image_data,
     if (num == 0)
     {
         mean = raw_info.black_level;
-        stdev = 8; /* default to 11 stops of DR */
+        /* default to 11 stops (14-log2(8)) of DR */
+        stdev = 8 + 6;  // (+6 for 20bits res)
     }
     
     *out_mean = mean;
@@ -664,8 +678,7 @@ static int identify_bright_and_dark_fields(struct raw_info raw_info, uint16_t * 
 static void apply_correction(double a, double b, int h, int w, struct raw_info raw_info, int black20, int white20, uint32_t* raw_buffer_32, double * corr_ev, int * white_darkened, int * is_bright)
 {
     /* apply the correction */
-    double b20 = b * 16;
-#pragma omp parallel for schedule(static) default(none) shared(black20, is_bright, h, w, b20, raw_buffer_32, raw_info, a) collapse(2)
+#pragma omp parallel for schedule(static) default(none) shared(black20, is_bright, h, w, b, raw_buffer_32, raw_info, a) collapse(2)
     for (int y = 0; y < h; y ++)
     {
         for (int x = 0; x < w; x ++)
@@ -676,11 +689,11 @@ static void apply_correction(double a, double b, int h, int w, struct raw_info r
             if (BRIGHT_ROW)
             {
                 /* bright exposure: darken and apply the black offset (fixme: why not half?) */
-                p = (p - black20) * a + black20 + b20*a;
+                p = (p - black20) * a + black20 + b*a;
             }
             else
             {
-                p = p - b20 + b20*a;
+                p = p - b + b*a;
             }
             
             /* out of range? */
@@ -690,41 +703,43 @@ static void apply_correction(double a, double b, int h, int w, struct raw_info r
             raw_set_pixel20(x, y, p);
         }
     }
-    *white_darkened = (white20 - black20 + b20) * a + black20;
+    *white_darkened = (white20 - black20 + b) * a + black20;
     
     double factor = 1/a;
+    *corr_ev = log2(factor);
+
+#ifndef STDOUT_SILENT
+    printf("ISO difference  : %.2f EV (%d) (a[%f] b[%f])\n", *corr_ev, (int)round(factor*100), a, b);
+    printf("Whites  :       : %d(darkened) %d\n", *white_darkened, white20);
+    printf("Black delta     : %.2f\n", b/4); /* we want to display black delta for the 14-bit original data, but we have computed it from 16-bit data */
+#endif
+
+#ifndef STDOUT_SILENT
     if (factor < 1.2 || !isfinite(factor))
     {
-#ifndef STDOUT_SILENT
         printf("Doesn't look like interlaced ISO\n");
-#endif
-        return 0;
     }
-    
-    *corr_ev = log2(factor);
-#ifndef STDOUT_SILENT
-    printf("ISO difference  : %.2f EV (%d)\n", log2(factor), (int)round(factor*100));
-    printf("Black delta     : %.2f\n", b/4); /* we want to display black delta for the 14-bit original data, but we have computed it from 16-bit data */
 #endif
 }
 
 static int match_exposures(struct raw_info raw_info, uint32_t * raw_buffer_32, double * corr_ev,
                            int * white_darkened, int * is_bright, dual_iso_freeze_data_t* iso_data)
 {
+    int plot_iso_curve = 0;
+
     /* guess ISO - find the factor and the offset for matching the bright and dark images */
     int black20 = raw_info.black_level;
     int white20 = MIN(raw_info.white_level, *white_darkened);
-    int black16 = black20 >> 4;
-    int white16 = white20 >> 4;
-    int clip0 = white16 - black16;
+    int black = black20/16;
+    int white = white20/16;
+    int clip0 = white - black;
     int clip  = clip0 * 0.95;    /* there may be nonlinear response in very bright areas */
-    
+
     int w = raw_info.width;
     int h = raw_info.height;
     int y0 = raw_info.active_area.y1 + 2;
 
     if (iso_data->freeze == 2){
-        //printf("ab %f/%f %f\n",iso_data->a,iso_data->b,iso_data->b*iso_data->a);
         apply_correction(iso_data->a, iso_data->b, h, w, raw_info, black20, white20, raw_buffer_32, corr_ev, white_darkened, is_bright);
         return 1;
     }
@@ -734,112 +749,226 @@ static int match_exposures(struct raw_info raw_info, uint32_t * raw_buffer_32, d
     int* bright = malloc(w * h * sizeof(bright[0]));
     memset(dark, 0, w * h * sizeof(dark[0]));
     memset(bright, 0, w * h * sizeof(bright[0]));
-#pragma omp parallel for schedule(static) default(none) shared(raw_info, raw_buffer_32, is_bright, y0,h,w,black16,dark,bright,clip,clip0)
-    for (int y = y0; y < h-2; y += 3)
+    
+    for (int y = y0; y < h-2; y++)
     {
         int* native = BRIGHT_ROW ? bright : dark;
         int* interp = BRIGHT_ROW ? dark : bright;
 
-        for (int x = 0; x < w; x += 3)
+        for (int x = 0; x < w; x++)
         {
-            int pa = raw_get_pixel_20to16(x, y-2) - black16;
-            int pb = raw_get_pixel_20to16(x, y+2) - black16;
-            int pn = raw_get_pixel_20to16(x, y) - black16;
-            int pi = (pa + pb + 1) >> 1;
-            if (pa >= clip || pb >= clip) pi = clip0;               /* pixel too bright? discard */
-            if (pi >= clip) pn = clip0;                             /* interpolated pixel not good? discard the other one too */
+            int pa = raw_get_pixel_20to16(x, y-2) - black;
+            int pb = raw_get_pixel_20to16(x, y+2) - black;
+            int pn = raw_get_pixel_20to16(x, y) - black;
+            int pi = (pa + pb + 1) / 2;
+            if (pa >= clip || pb >= clip || pn >= clip)
+                pi = pn = clip0;               /* pixel too bright? discard */
             interp[x + y * w] = pi;
             native[x + y * w] = pn;
         }
     }
-    
-    /*
+
+    /* 
      * Robust line fit (match unclipped data):
-     * - use (median_bright, median_dark) as origin
-     * - select highlights between 98 and 99.9th percentile to find the slope (ISO)
-     * - choose the slope that explains the largest number of highlight points (inspired from RANSAC)
-     *
-     * Rationale:
-     * - exposure matching is important to be correct in bright_highlights (which are combined with dark_midtones)
-     * - low percentiles are likely affected by noise (this process is essentially a histogram matching)
-     * - as ad-hoc as it looks, it's the only method that passed all the test samples so far.
+     * - divide the image into a MxM grid (M=50)
+     * - consider only unclipped data (each ISO has its own white level)
+     * - compute low-iso median for each cell (unclipped data only)
+     * - compute median difference for each cell (unclipped data only)
+     * - line fit: X = low iso medians, Y = low iso medians + median difference
+     * - adjust (darken) high ISO to match low ISO
+     * - repeat to fine-tune the result
      */
-    int nmax = (w+2) * (h+2) / 9;
-    int * tmp = malloc(nmax * sizeof(tmp[0]) * 2);
-    int * tmp2 = tmp + nmax;
-    
-    /* median_bright/dark */
-    int n = 0;
-    for (int y = y0; y < h-2; y+=3)
-    {
-        for (int x = 0; x < w; x+=3)
-        {
-            int b = bright[x + y*w];
-            if (b >= clip) continue;
-            tmp[n] = b;
-            tmp2[n++] = dark[x + y*w];
-        }
-    }
-    int bmed = median_int_wirth(tmp, n);
-    int dmed = median_int_wirth(tmp2, n);
-    
-    /* also compute the range for bright pixels (used to find the slope) */
-    int b_lo = kth_smallest_int(tmp, n, n*98/100);
-    int b_hi = kth_smallest_int(tmp, n, n*99.9/100);
-    
-    /* select highlights used to find the slope (ISO) */
-    /* (98th percentile => up to 2% highlights) */
-    int hi_nmax = nmax/50;
-    int hi_n = 0;
-    int* hi_dark = malloc(hi_nmax * sizeof(hi_dark[0]));
-    int* hi_bright = malloc(hi_nmax * sizeof(hi_bright[0]));
-    
-    for (int y = y0; y < h-2; y += 3)
-    {
-        for (int x = 0; x < w; x += 3)
-        {
-            int b = bright[x + y*w];
-            if (b >= b_hi) continue;
-            if (b <= b_lo) continue;
-            hi_dark[hi_n] = dark[x + y*w];
-            hi_bright[hi_n] = b;
-            //raw_set_pixel32(x,y,black20);
-            if (++hi_n >= hi_nmax) goto ENDLOOP; // break nested loop
-        }
-    }
-ENDLOOP:
-    double a = 0;
+
+    /* y = a*x + b */
+    /* y = bright, x = dark */
+    double a = 1;
     double b = 0;
 
-    int best_score = 0;
-    //This loop updates "a" and "b" when the maximum score is updated. Needs to be rewritten to make it parallelizable
-    for (double ev = 0; ev < 6; ev += 0.002)
+    /* fixme: when to stop? */
+    for (int iter = 0; iter < 5; iter++)
     {
-        double test_a = pow(2, -ev);
-        double test_b = dmed - bmed * test_a;
-        
-        int score = 0;
-        for (int i = 0; i < hi_n; i++)
+        const int M = 50;
+
+        int Darks[3*M*M];
+        int Brigs[3*M*M];
+        int K = 0;
+
+        for (int ch = 0; ch < 3; ch++)
         {
-            int d = hi_dark[i];
-            int b = hi_bright[i];
-            int e = d - (b*test_a + test_b);
-            if (ABS(e) < 50) score++;
+            for (int i = 0; i < M; i++)
+            {
+                for (int j = 0; j < M; j++)
+                {
+                    /* cell (i,j) */
+                    const int nmax = (1 + w / M) * (1 + h / M);
+                    int * darks = malloc(nmax * sizeof(darks[0]));
+                    int * diffs = malloc(nmax * sizeof(diffs[0]));
+                    int k = 0;
+                    int all = 0;
+
+                    for (int y = i * h / M; y < (i + 1) * h / M; y++)
+                    {
+                        if (y < y0) continue;
+                        if (y >= h-2) continue;
+
+                        for (int x = j * w / M; x < (j + 1) * w / M; x++)
+                        {
+                            /* one data point per channel */
+                            /* fixme: scan the image once, not 3 times */
+                            if (FC(y,x) != ch)
+                            {
+                                continue;
+                            }
+
+                            int lo = dark[x + y * w];
+                            int hi = bright[x + y * w];
+
+                            /* note: clipped pixels were all set to clip0 */
+                            if (lo != clip0 && hi != clip0)
+                            {
+                                assert(k < nmax);
+                                assert(lo < clip);
+                                assert(hi < clip);
+                                darks[k] = lo;
+                                diffs[k] = (hi-b)/a - lo;
+                                k++;
+                            }
+                            all++;
+                        }
+                    }
+
+                    /* more than 25% valid pixels? */
+                    if (k > all / 4)
+                    {
+                        assert(K < COUNT(Darks));
+                        Darks[K] = median_int_wirth(darks, k);
+                        int dmed = median_int_wirth(diffs, k);
+                        Brigs[K] = (dmed + Darks[K]) * a + b;
+                        if (0)
+                        {
+                            /* debug info */
+                            /* reuse darks to check the interquartile range of diffs */
+                            /* this will be very high at first iteration
+                             * but much lower at the next one(s) */
+                            int * quart = darks;
+                            int q = 0;
+                            for (int i = 0; i < k; i++)
+                                if (diffs[i] < dmed)
+                                    quart[q++] = diffs[i];
+                            int p25 = median_int_wirth(quart, q);
+                            q = 0;
+                            for (int i = 0; i < k; i++)
+                                if (diffs[i] > dmed)
+                                    quart[q++] = diffs[i];
+                            int p75 = median_int_wirth(quart, q);
+                            printf("diff range: %d - %d\n", p25, p75);
+                        }
+                        K++;
+                    }
+
+                    free(darks);
+                    free(diffs);
+                }
+            }
         }
-        if (score > best_score)
+
+        /* linear fit on Diffs vs Darks */
+
+        /*
+         * some sort of robust linear fitting
+         * median for X, median for Y, median for angle (atan2)
+         */
+        int * aux = malloc(K * sizeof(aux[0]));
+        memcpy(aux, Darks, K * sizeof(aux[0]));
+        int mx = median_int_wirth(aux, K);
+        memcpy(aux, Brigs, K * sizeof(aux[0]));
+        int my = median_int_wirth(aux, K);
+        free(aux);
+
+        int * Angles = malloc(K * sizeof(Angles[0]));
+        for (int i = 0; i < K; i++)
         {
-            best_score = score;
-            a = test_a;
-            b = test_b;
+            double ang = atan2(Brigs[i] - my, Darks[i] - mx);
+            while (ang < 0) ang += M_PI;
+            Angles[i] = (int)round(ang * 1000000);
+        }
+        int ma = median_int_wirth(Angles, K);
+        free(Angles);
+
+        /* convert to y = ax + b */
+        a = tan(ma / 1000000.0);
+        b = my - a * mx;
+
+        /* print values normalized to 14-bit */
+        /* b is usually negative */
+#ifndef STDOUT_SILENT
+        printf("Linear fit      : y = %.4f*x - %.2f\n", a, -b/64);
+#endif
+        if (plot_iso_curve)
+        {
+            FILE* f = fopen("iso-curve.m", "w");
+            fprintf(f, "a = %g\n", a);
+            fprintf(f, "b = %g\n", b);
+            fprintf(f, "clip = %d\n", clip);
+            fprintf(f, "Darks = [ ");
+            for (int i = 0; i < K; i++)
+                fprintf(f, "%d ", Darks[i]);
+            fprintf(f, "];\n");
+            fprintf(f, "Brigs = [ ");
+            for (int i = 0; i < K; i++)
+                fprintf(f, "%d ", Brigs[i]);
+            fprintf(f, "];\n");
+            fprintf(f, "black_delta = -b / (a + 1);");
+            fprintf(f, "graphics_toolkit gnuplot;\n");
+            fprintf(f, "plot(Darks - black_delta, Brigs + black_delta, '.r');\n");
+            fprintf(f, "axis auto; set(gca,'xscale','log'); set(gca,'yscale','log'); axis tight; ax = axis;\n");
+            fprintf(f, "hold on, plot(linspace(1, clip/a, 1000) - black_delta, linspace(1, clip/a, 1000) * a + b + black_delta); axis(ax);\n");
+            fprintf(f, "print -dpng iso-curve-%d.png\n", iter);
+            fclose(f);
+            if(system("octave iso-curve.m"));
         }
     }
 
-    free(hi_dark); hi_dark = 0;
-    free(hi_bright); hi_bright = 0;
-    free(tmp); tmp = 0;
-    
+#if 0
+    for (int y = 0; y < h; y ++)
+        for (int x = 0; x < w; x ++)
+            raw_set_pixel16(x, y, dark[x + y*w] * a + b + black);
+    save_debug_dng("fit-dark.dng");
+    for (int y = 0; y < h; y ++)
+        for (int x = 0; x < w; x ++)
+            raw_set_pixel16(x, y, bright[x + y*w] + black);
+    save_debug_dng("fit-bright.dng");
+    for (int y = 0; y < h; y ++)
+        for (int x = 0; x < w; x ++)
+            raw_set_pixel16(x, y, 100 * (bright[x + y*w] - (dark[x + y*w] * a + b)) + white/2);
+    save_debug_dng("fit-delta.dng");
+    for (int y = 0; y < h; y ++)
+        for (int x = 0; x < w; x ++)
+            raw_set_pixel16(x, y, 100 * (bright[x + y*w]/a - b/a - dark[x + y*w]) + white/2);
+    save_debug_dng("fit-delta2.dng");
+#endif
+
     free(dark);
     free(bright);
+
+    /* apply the correction */
+
+    /* previous code used different assumption: dark = a * bright + b */
+    /* y = ax + b => x = y/a - b/a */
+    a = 1/a;
+    b *= a; b = -b;
+
+    /*
+     * We already know that EXIF black level is the average of the black levels
+     * for bright and dark exposures, so their offset is symmetrical around the mean
+     * 
+     * Usually, the brighter exposure ends up having a lower black level.
+     *
+     * From fitting: dark-black = a * (bright-black) + b
+     * Find black delta so that (dark-black-delta) = a * (bright-black+delta).
+     */
+    double b20 = b * 16;
+    double black_delta20 = b20 / (a + 1);
 
     if (iso_data->freeze == 1){
         iso_data->freeze = 2;
@@ -847,7 +976,7 @@ ENDLOOP:
         iso_data->b = b;
     }
     
-    apply_correction(a, b, h, w, raw_info, black20, white20, raw_buffer_32, corr_ev, white_darkened, is_bright);
+    apply_correction(a, b20, h, w, raw_info, black20, white20, raw_buffer_32, corr_ev, white_darkened, is_bright);
 
     return 1;
 }
@@ -906,15 +1035,17 @@ static inline void build_ev2raw_lut(int * raw2ev, int * ev2raw_0, int black, int
     //~ printf("%d %d %d %d %d %d %d *%d* %d %d %d %d %d\n", ev2raw[raw2ev[0]], ev2raw[raw2ev[16000]], ev2raw[raw2ev[32000]], ev2raw[raw2ev[131068]], ev2raw[raw2ev[131069]], ev2raw[raw2ev[131070]], ev2raw[raw2ev[131071]], ev2raw[raw2ev[131072]], ev2raw[raw2ev[131073]], ev2raw[raw2ev[131074]], ev2raw[raw2ev[131075]], ev2raw[raw2ev[131076]], ev2raw[raw2ev[132000]]);
 }
 
-static inline double compute_noise(struct raw_info raw_info, uint16_t * image_data, double * noise_std, double * dark_noise, double * bright_noise, double * dark_noise_ev, double * bright_noise_ev)
+static inline double compute_noise20(struct raw_info raw_info, uint32_t * image_data, double * noise_std, double * dark_noise, double * bright_noise, double * dark_noise_ev, double * bright_noise_ev)
 {
+    // Fixme : We should use black bars to compute noise levels, but they are not present here
     double noise_avg = 0.0;
-#pragma omp parallel for schedule(static) num_threads(4) default(none) shared(raw_info, image_data, noise_avg, noise_std)
     for (int y = 0; y < 4; y++)
-        compute_black_noise(raw_info, image_data, 8, raw_info.active_area.x1 - 8, raw_info.active_area.y1/4*4 + 20 + y, raw_info.active_area.y2 - 20, 1, 4, &noise_avg, &noise_std[y]);
+        compute_black_noise20(raw_info, image_data, raw_info.active_area.y1/4*4 + 20 + y, raw_info.active_area.y2 - 20, 1, 4, &noise_avg, &noise_std[y]);
+
 #ifndef STDOUT_SILENT
     printf("Noise levels    : %.02f %.02f %.02f %.02f (14-bit)\n", noise_std[0], noise_std[1], noise_std[2], noise_std[3]);
 #endif
+
     *dark_noise = MIN(MIN(noise_std[0], noise_std[1]), MIN(noise_std[2], noise_std[3]));
     *bright_noise = MAX(MAX(noise_std[0], noise_std[1]), MAX(noise_std[2], noise_std[3]));
     *dark_noise_ev = log2(*dark_noise);
@@ -1965,12 +2096,10 @@ static inline void convert_20_to_16bit(struct raw_info raw_info, uint16_t * imag
     raw_info.black_level /= 16;
     raw_info.white_level /= 16;
     
-#pragma omp parallel for schedule(static) default(none) shared(h,w,image_data, raw_buffer_32, raw_info) collapse(2)
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++)
-            raw_set_pixel_20to16_rand(x, y, raw_buffer_32[x + y*w]);
+#pragma omp parallel for schedule(static) default(none) shared(h,w,image_data, raw_buffer_32, raw_info)
+    for (int i = 0; i < w * h; i++)
+        raw_set_pixel_20to16_rand(i, raw_buffer_32[i]);
 }
-
 
 /**
  * Fix vertical stripes (banding) from 5D Mark III (and maybe others).
@@ -2573,26 +2702,30 @@ int diso_get_full20bit(struct raw_info raw_info,dual_iso_freeze_data_t* iso_data
 #ifdef PERF_INFO
     perf_clock = clock();
 #endif
+
     white_detect(raw_info, image_data, &white, &white_bright, is_bright);
-//    white = 16383;
-//    white_bright = 14880;
+    white *= 64;
+    white_bright *= 64;
+    raw_info.white_level = white;
 
 #ifdef PERF_INFO
     perf_clock = clock()-perf_clock;
     printf("white_detect took %f seconds\n", ((double) perf_clock) / CLOCKS_PER_SEC);
     fflush(stdout);
 #endif
-    white *= 64;
-    white_bright *= 64;
-    raw_info.white_level = white;
 
+    uint32_t * raw_buffer_32 = convert_to_20bit(raw_info, image_data);
     double noise_std[4];
     double dark_noise, bright_noise, dark_noise_ev, bright_noise_ev;
+
 #ifdef PERF_INFO
     perf_clock = clock();
 #endif
-    double noise_avg = compute_noise(raw_info, image_data, noise_std, &dark_noise, &bright_noise, &dark_noise_ev, &bright_noise_ev);
+
+    double noise_avg = compute_noise20(raw_info, raw_buffer_32, noise_std, &dark_noise, &bright_noise, &dark_noise_ev, &bright_noise_ev);
+
 #ifdef PERF_INFO
+
     perf_clock = clock()-perf_clock;
     printf("compute_noise took %f seconds\n", ((double) perf_clock) / CLOCKS_PER_SEC);
     fflush(stdout);
@@ -2601,18 +2734,12 @@ int diso_get_full20bit(struct raw_info raw_info,dual_iso_freeze_data_t* iso_data
     perf_clock = clock();
 #endif
     /* promote from 14 to 20 bits (original raw buffer holds 14-bit values stored as uint16_t) */
-    uint32_t * raw_buffer_32 = convert_to_20bit(raw_info, image_data);
 
 #ifdef PERF_INFO
     perf_clock = clock()-perf_clock;
     printf("convert_to_20bit took %f seconds\n", ((double) perf_clock) / CLOCKS_PER_SEC);
     fflush(stdout);
 #endif
-    /* we have now switched to 20-bit, update noise numbers */
-    dark_noise *= 64;
-    bright_noise *= 64;
-    dark_noise_ev += 6;
-    bright_noise_ev += 6;
 
 #ifdef PERF_INFO
     perf_clock = clock();
@@ -2644,31 +2771,6 @@ int diso_get_full20bit(struct raw_info raw_info,dual_iso_freeze_data_t* iso_data
         memset(alias_map, 0, w * h * sizeof(uint16_t));
     }
     
-    /* fullres mixing curve */
-    static double fullres_curve[1<<20];
-#ifdef PERF_INFO
-    perf_clock = clock()-perf_clock;
-    printf("allocate memory took %f seconds\n", ((double) perf_clock) / CLOCKS_PER_SEC);
-    fflush(stdout);
-#endif
-
-#ifdef PERF_INFO
-    perf_clock = clock();
-#endif
-    for (int i = 0; i < (1<<20); i++)
-    {
-        double ev2 = log2(MAX(i/64.0 - black/64.0, 1));
-        double c2 = -cos(COERCE(ev2 - fullres_start, 0, fullres_transition)*M_PI/fullres_transition);
-        double f = (c2+1) / 2;
-        fullres_curve[i] = f;
-    }
-#ifdef PERF_INFO
-    perf_clock = clock()-perf_clock;
-    printf("fullres curve initialization took %f seconds\n", ((double) perf_clock) / CLOCKS_PER_SEC);
-    fflush(stdout);
-#endif
-
-    //~ printf("Exposure matching...\n");
     /* estimate ISO difference between bright and dark exposures */
     double corr_ev = 0;
     int white_darkened = white_bright;
@@ -2698,7 +2800,7 @@ int diso_get_full20bit(struct raw_info raw_info,dual_iso_freeze_data_t* iso_data
     double lowiso_dr = log2(white - black) - dark_noise_ev;
 #ifndef STDOUT_SILENT
     double highiso_dr = log2(white_bright - black) - bright_noise_ev;
-    printf("Dynamic range   : %.02f (+) %.02f => %.02f EV (in theory)\n", lowiso_dr, highiso_dr, highiso_dr + corr_ev);
+    printf("Dynamic range   : %.02f (+) %.02f => %.02f EV (@14 bits, in theory)\n", lowiso_dr-6, highiso_dr-6, highiso_dr + corr_ev-6);
 #endif
     /* correction factor for the bright exposure, which was just darkened */
     double corr = pow(2, corr_ev);
@@ -2861,7 +2963,7 @@ int diso_get_full20bit(struct raw_info raw_info,dual_iso_freeze_data_t* iso_data
             for (int x = 2; x < w-2; x ++)
                 raw_set_pixel32(x, y, bright[x + y*w]);
 
-        compute_black_noise(raw_info, image_data, 8, raw_info.active_area.x1 - 8, raw_info.active_area.y1 + 20, raw_info.active_area.y2 - 20, 1, 1, &noise_avg, &noise_std[0]);
+        compute_black_noise20(raw_info, raw_buffer_32, raw_info.active_area.y1 + 20, raw_info.active_area.y2 - 20, 1, 1, &noise_avg, &noise_std[0]);
 #ifdef PERF_INFO
     perf_clock = clock()-perf_clock;
     printf("compute_black_noise took %f seconds\n", ((double) perf_clock) / CLOCKS_PER_SEC);
@@ -2883,7 +2985,7 @@ int diso_get_full20bit(struct raw_info raw_info,dual_iso_freeze_data_t* iso_data
     perf_clock = clock();
 #endif
         /* let's see how much dynamic range we actually got */
-        compute_black_noise(raw_info, image_data, 8, raw_info.active_area.x1 - 8, raw_info.active_area.y1 + 20, raw_info.active_area.y2 - 20, 1, 1, &noise_avg, &noise_std[0]); 
+        compute_black_noise20(raw_info, raw_buffer_32, raw_info.active_area.y1 + 20, raw_info.active_area.y2 - 20, 1, 1, &noise_avg, &noise_std[0]); 
 #ifdef PERF_INFO
     perf_clock = clock()-perf_clock;
     printf("compute_black_noise took %f seconds\n", ((double) perf_clock) / CLOCKS_PER_SEC);
