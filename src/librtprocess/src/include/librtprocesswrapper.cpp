@@ -12,6 +12,8 @@
 extern "C" {
 #endif
 
+#include <stdint.h>
+
 //Module globals
 bool myFunc( double val ){ return true; }
 unsigned cfa[2][2] = { { 0, 1 }, { 1, 2 } };

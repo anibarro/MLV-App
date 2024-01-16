@@ -24,6 +24,8 @@
 
 #if defined(__linux)
 #include <stddef.h>
+#elif defined(_WIN32)
+#include <stddef.h>
 #endif
 
 enum rpError {RP_NO_ERROR, RP_MEMORY_ERROR, RP_WRONG_CFA, RP_CACORRECT_ERROR};

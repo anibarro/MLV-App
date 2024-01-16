@@ -1,0 +1,70 @@
+name: Windows Release
+
+on:
+  workflow_dispatch:
+    branches: [ "master" ]
+
+env:
+  SOURCE_DIR:   ${{ github.workspace }}\platform
+  ARTIFACT:     ${{ github.workspace }}\platform\build\MLVApp\MLVApp.Win64.zip
+
+jobs:
+  build:
+
+    runs-on: windows-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install OpenSSL
+      run: |
+           choco install openssl
+           dir "C:\Program Files\OpenSSL\"
+           dir "C:\Program Files\OpenSSL\bin"
+              
+    - name: Install Qt
+      run: |
+           choco install qt5-default
+           dir C:\Qt\5.15.2\mingw81_64\bin
+           dir C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin
+
+    - name: Create build directory
+      run:  mkdir ${{ env.SOURCE_DIR }}\build
+
+    - name: Build
+      working-directory: ${{ env.SOURCE_DIR }}\build
+      run:  |
+            C:\Qt\5.15.2\mingw81_64\bin\qmake.exe -r ${{ env.SOURCE_DIR }}\qt\MLVApp.pro
+            make.exe
+            dir
+            cd release
+            C:\Qt\5.15.2\mingw81_64\bin\windeployqt MLVApp.exe
+            copy C:\ProgramData\chocolatey\lib\mingw\tools\install\mingw64\bin\libgomp-1.dll .
+            copy "C:\Program Files\OpenSSL\bin\libcrypto-1_1-x64.dll" .
+            copy "C:\Program Files\OpenSSL\bin\libssl-1_1-x64.dll" .
+            dir
+
+    - name: Decompress FFMPEG
+      working-directory: ${{ env.SOURCE_DIR }}\qt\FFmpeg
+      run:  |
+            7z x ffmpegWin64.zip -o${{ env.SOURCE_DIR }}\build\release
+
+    - name: Decompress RAW2MLV
+      working-directory: ${{ env.SOURCE_DIR }}\qt\raw2mlv
+      run:  |
+            7z x raw2mlvWin64.zip -o${{ env.SOURCE_DIR }}\build\release
+            move ${{ env.SOURCE_DIR }}\build\release\Windows64\* ${{ env.SOURCE_DIR }}\build\release
+            rmdir ${{ env.SOURCE_DIR }}\build\release\Windows64
+            dir ${{ env.SOURCE_DIR }}\build\release
+
+    - name: Rename release folder
+      working-directory: ${{ env.SOURCE_DIR }}\build
+      run: |
+           ren release MLVApp
+           dir
+
+    - name: Save build artifact
+      uses: actions/upload-artifact@master
+      with:
+        name: MLVApp Windows 64bit
+        path: ${{ env.SOURCE_DIR }}\build\MLVApp

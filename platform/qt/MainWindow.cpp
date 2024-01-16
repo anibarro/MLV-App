@@ -100,6 +100,12 @@ MainWindow::MainWindow(int &argc, char **argv, QWidget *parent) :
     //Change working directory for C part
     chdir( QCoreApplication::applicationDirPath().toLatin1().data() );
 
+    //Enable color management for macOS
+    auto format = QSurfaceFormat::defaultFormat();
+    format.setSwapInterval(0);
+    format.setColorSpace( QSurfaceFormat::sRGBColorSpace );
+    QSurfaceFormat::setDefaultFormat(format);
+
     ui->setupUi(this);
     setAcceptDrops(true);
     qApp->installEventFilter( this );
@@ -3034,6 +3040,9 @@ void MainWindow::startExportAVFoundation(QString fileName)
     else if( m_codecProfile == CODEC_H264 ) avfCodec = AVF_CODEC_H264;
 #if MAC_OS_X_VERSION_MIN_REQUIRED >= 101300
     else if( m_codecProfile == CODEC_H265_8 ) avfCodec = AVF_CODEC_HEVC;
+    else if( m_codecProfile == CODEC_PRORES422PROXY ) avfCodec = AVF_CODEC_PRORES_422_PROXY;
+    else if( m_codecProfile == CODEC_PRORES422LT ) avfCodec = AVF_CODEC_PRORES_422_LT;
+    else if( m_codecProfile == CODEC_PRORES422HQ ) avfCodec = AVF_CODEC_PRORES_422_HQ;
 #endif
     else avfCodec = AVF_CODEC_PRORES_4444;
 
@@ -3208,18 +3217,21 @@ void MainWindow::startExportAVFoundation(QString fileName)
                                     << QString( "copy" )
                                     << QString( "%1" ).arg( fileName );
 
-        QProcess ffmpegProc;
+        QProcess *ffmpegProc = new QProcess( this );
         int i = 0;
         //Try 3x with delay. AVFoundation lib maybe isn't ready yet.
-        while( ffmpegProc.execute( ffmpegAudioCommand, ffmpegAudioCommandArguments ) != 0 && i < 3 )
+        while( ffmpegProc->execute( ffmpegAudioCommand, ffmpegAudioCommandArguments ) != 0 && i < 3 )
         {
             i++;
             QThread::msleep( 500 );
             //Abort pressed? -> End the loop
             if( m_exportAbortPressed ) break;
         }
+        delete ffmpegProc;
         if( i < 3 && !m_exportAbortPressed )
         {
+            QFile( tempFileName ).open( QIODevice::WriteOnly ); //AVFoundation seems to block the file - so we make it a 0Byte file -> free disk memory
+            QFile( tempFileName ).close();
             QFile( tempFileName ).remove();
             QFile( wavFileName ).remove();
         }
@@ -7579,8 +7591,16 @@ void MainWindow::deleteFileFromSession( void )
     setReceipt( ACTIVE_RECEIPT );
 
     //Ask for options
-    int delFile = QMessageBox::question( this, tr( "%1 - Remove clip" ).arg( APPNAME ), tr( "Remove clip from session, or delete clip from disk?" ), tr( "Remove" ), tr( "Delete from Disk" ), tr( "Abort" ) );
-    if( delFile == 2 ) return; //Abort
+    QMessageBox msg;
+    msg.setIcon( QMessageBox::Question );
+    msg.setWindowTitle( tr( "%1 - Remove clip" ).arg( APPNAME ) );
+    msg.setText( tr( "Remove clip from session, or delete clip from disk?" ) );
+    msg.addButton(tr("Remove"), QMessageBox::ApplyRole);
+    QPushButton *deleteButton = msg.addButton(tr("Delete from Disk"), QMessageBox::ActionRole);
+    QPushButton *abortButton = msg.addButton(tr("Abort"), QMessageBox::RejectRole);
+    msg.setDefaultButton( abortButton );
+    msg.exec();
+    if( msg.clickedButton() == abortButton ) return;
 
     //begin clip delete process
     m_inClipDeleteProcess = true;
@@ -7597,7 +7617,7 @@ void MainWindow::deleteFileFromSession( void )
 
         int row = list.at( i - 1 ).data( ROLE_REALINDEX ).toInt();
         //Delete file from disk when wanted
-        if( delFile == 1 )
+        if( msg.clickedButton() == deleteButton )
         {
             //MLV
 #ifdef Q_OS_WIN //On windows the file has to be closed before beeing able to move to trash
@@ -8320,8 +8340,7 @@ void MainWindow::exportHandler( void )
             startExportCdng( m_exportQueue.first()->exportFileName() );
         }
 #ifdef Q_OS_MACX
-        else if( ( m_codecProfile == CODEC_PRORES422ST && m_codecOption == CODEC_PRORES_AVFOUNDATION )
-              || ( m_codecProfile == CODEC_PRORES4444 && m_codecOption == CODEC_PRORES_AVFOUNDATION )
+        else if( ( m_codecProfile <= CODEC_PRORES4444 && m_codecOption == CODEC_PRORES_AVFOUNDATION )
               || ( m_codecProfile == CODEC_H264 && m_codecOption == CODEC_H264_AVFOUNDATION )
 #if MAC_OS_X_VERSION_MIN_REQUIRED >= 101300
               || ( m_codecProfile == CODEC_H265_8 && m_codecOption == CODEC_H265_AVFOUNDATION )
@@ -10692,9 +10711,17 @@ void MainWindow::focusPixelCheckAndInstallation()
             if( camidGetCameraName( camId, 1 ) != NULL ) camName.append( QString( " / %1" ).arg( camidGetCameraName( camId, 1 ) ) );
             if( camidGetCameraName( camId, 2 ) != NULL ) camName.append( QString( " / %1" ).arg( camidGetCameraName( camId, 2 ) ) );
 
-            int ret = QMessageBox::question( this, APPNAME, tr( "Download and install focus pixel map for this clip or install all focus pixel maps for %1?" ).arg( camName ), tr( "Single Map" ), tr( "All Maps" ), tr( "None" ) );
+            QMessageBox msg;
+            msg.setIcon( QMessageBox::Question );
+            msg.setText( tr( "Download and install focus pixel map for this clip or install all focus pixel maps for %1?" ).arg( camName ) );
+            QPushButton *singleButton = msg.addButton(tr("Single Map"), QMessageBox::ApplyRole);
+            QPushButton *allButton = msg.addButton(tr("All Maps"), QMessageBox::ActionRole);
+            msg.addButton(tr("None"), QMessageBox::RejectRole);
+            msg.setDefaultButton( singleButton );
+            msg.exec();
+
             StatusFpmDialog *status = new StatusFpmDialog( this );
-            if( ret == 0 )
+            if( msg.clickedButton() == singleButton )
             {
                 status->open();
                 if( fpmManager->downloadMap( m_pMlvObject ) )
@@ -10709,7 +10736,7 @@ void MainWindow::focusPixelCheckAndInstallation()
                     QMessageBox::critical( this, APPNAME, tr( "Download and installation of focus pixel map failed." ) );
                 }
             }
-            else if( ret == 1 )
+            else if( msg.clickedButton() == allButton )
             {
                 status->open();
                 if( fpmManager->downloadAllMaps( m_pMlvObject ) )
